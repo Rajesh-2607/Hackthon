@@ -106,10 +106,14 @@ def get_gemini_analysis(features: dict, risk_score: float, prediction: str) -> s
     if not api_key:
         return "Gemini analysis unavailable: API key not configured. Set GEMINI_API_KEY in .env file."
 
-    try:
-        client = genai.Client(api_key=api_key)
+    # Models to try in order of preference
+    MODELS = [
+        "models/gemini-2.5-flash",
+        "models/gemini-2.0-flash",
+        "models/gemini-2.5-pro",
+    ]
 
-        prompt = f"""You are a social media security analyst AI. Analyze this account profile and provide a concise threat assessment.
+    prompt = f"""You are a social media security analyst AI. Analyze this account profile and provide a concise threat assessment.
 
 Account Profile Data:
 - Has Profile Picture: {"Yes" if features["profile_pic"] else "No"}
@@ -134,11 +138,17 @@ Provide a brief 3-4 sentence analysis covering:
 
 Be concise and professional. Do not use markdown formatting."""
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-preview-05-20",
-            contents=prompt
-        )
-        return response.text.strip()
+    client = genai.Client(api_key=api_key)
 
-    except Exception as e:
-        return f"Gemini analysis error: {str(e)}"
+    for model_name in MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
+            return response.text.strip()
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    return f"Gemini analysis error: All models failed. Last error: {last_error}"
