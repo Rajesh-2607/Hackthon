@@ -2,11 +2,76 @@
 Utility functions for feature engineering and Gemini LLM integration.
 """
 import os
+import re
 import numpy as np
 from google import genai
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ---------- Suspicious / Unwanted Words ----------
+
+SUSPICIOUS_WORDS = [
+    # Spam / scam phrases
+    "free followers", "follow back", "follow4follow", "f4f", "l4l", "like4like",
+    "dm me", "dm for", "click link", "link in bio", "buy followers",
+    "get rich", "make money", "earn money", "cash now", "crypto", "bitcoin",
+    "investment", "forex", "trading signals", "guaranteed returns",
+    # Impersonation / phishing
+    "official account", "not fake", "real account", "verified", "legit",
+    "giveaway", "winner", "congratulations", "you won", "claim now",
+    "limited offer", "act now", "urgent", "lottery",
+    # Adult / inappropriate
+    "onlyfans", "18+", "adult", "nsfw", "xxx",
+    # Bot-like patterns
+    "bot", "automated", "auto follow", "mass dm",
+    # Suspicious promotions
+    "promo code", "discount code", "use code", "sponsored",
+    "check out my", "subscribe", "free trial",
+]
+
+
+def scan_for_suspicious_words(username: str = None, bio_text: str = None) -> list[str]:
+    """
+    Scan username and bio text for suspicious/unwanted words.
+    Returns a list of flagged words/phrases found.
+    """
+    flagged = []
+    combined_text = ""
+
+    if username:
+        combined_text += username.lower() + " "
+    if bio_text:
+        combined_text += bio_text.lower()
+
+    if not combined_text.strip():
+        return flagged
+
+    for word in SUSPICIOUS_WORDS:
+        if word.lower() in combined_text:
+            flagged.append(word)
+
+    # Check for excessive special characters in username (bot-like)
+    if username:
+        special_char_ratio = len(re.findall(r'[^a-zA-Z0-9_.]', username)) / max(len(username), 1)
+        if special_char_ratio > 0.3:
+            flagged.append(f"Excessive special characters in username ({special_char_ratio:.0%})")
+
+        # Check for random-looking username (many consonants in a row)
+        if re.search(r'[bcdfghjklmnpqrstvwxyz]{5,}', username.lower()):
+            flagged.append("Username appears randomly generated")
+
+    # Check for repeated characters in bio (spam-like)
+    if bio_text and re.search(r'(.)\1{4,}', bio_text):
+        flagged.append("Repetitive characters in bio (spam-like)")
+
+    # Check for excessive URLs in bio
+    if bio_text:
+        url_count = len(re.findall(r'https?://\S+', bio_text))
+        if url_count >= 3:
+            flagged.append(f"Multiple URLs in bio ({url_count} found)")
+
+    return flagged
 
 # ---------- Feature Engineering ----------
 
@@ -97,16 +162,21 @@ def get_confidence_level(risk_score: float) -> str:
 
 # ---------- Gemini LLM Integration ----------
 
-def get_gemini_analysis(features: dict, risk_score: float, prediction: str, bio: str = "") -> str:
+def get_gemini_analysis(features: dict, risk_score: float, prediction: str,
+                        bio: str = "", username: str = None, bio_text: str = None,
+                        flagged_words: list = None) -> str:
     """
-    Use Google Gemini 2.5 to generate a natural language analysis
-    of the account's authenticity.
+    Use Google Gemini to generate a natural language analysis
+    of the account's authenticity, including text content analysis.
     
     Args:
         features: Dictionary of account features
         risk_score: ML model risk score (0-1)
         prediction: "Fake Account" or "Real Account"
-        bio: Account biography/description text
+        bio: Account biography/description text (from analyze endpoint)
+        username: Username text for scanning
+        bio_text: Bio text for scanning
+        flagged_words: List of flagged suspicious words
     """
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -121,6 +191,19 @@ def get_gemini_analysis(features: dict, risk_score: float, prediction: str, bio:
     
     # Truncate bio if too long
     bio_text = bio[:500] if bio else "No bio provided"
+
+    # Build optional text section
+    text_section = ""
+    if username or bio_text:
+        text_section += "\nUser-Provided Text Content:"
+        if username:
+            text_section += f"\n- Username: \"{username}\""
+        if bio_text:
+            text_section += f"\n- Bio/Description Text: \"{bio_text}\""
+
+    flagged_section = ""
+    if flagged_words:
+        flagged_section = f"\n\nFlagged Suspicious Words/Patterns Found: {', '.join(flagged_words)}"
 
     prompt = f"""You are a social media security analyst AI. Analyze this account profile and provide a concise threat assessment.
 
@@ -137,14 +220,17 @@ Account Profile Data:
 - Number of Posts: {features["posts"]}
 - Followers: {features["followers"]}
 - Following: {features["following"]}
+{text_section}
 
 ML Model Prediction: {prediction}
 Risk Score: {risk_score:.2%}
+{flagged_section}
 
-Provide a brief 3-4 sentence analysis covering:
+Provide a brief 3-5 sentence analysis covering:
 1. Why this account appears {prediction.lower()}
 2. Key behavioral red flags or positive signals (including analysis of the bio content if provided)
-3. Recommended action for the platform
+3. {"Analysis of the flagged suspicious words/patterns and what they suggest" if flagged_words else "Any text content observations if provided"}
+4. Recommended action for the platform
 
 Be concise and professional. Do not use markdown formatting."""
 
