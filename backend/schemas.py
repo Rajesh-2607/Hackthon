@@ -18,6 +18,9 @@ class AccountFeatures(BaseModel):
     posts: int = Field(..., ge=0, description="Number of posts")
     followers: int = Field(..., ge=0, description="Number of followers")
     following: int = Field(..., ge=0, description="Number of following")
+    # Optional text fields for deeper analysis
+    username: Optional[str] = Field(None, description="The actual username text for analysis")
+    bio_text: Optional[str] = Field(None, description="The actual bio/description text for analysis")
 
 
 class PredictionResponse(BaseModel):
@@ -26,6 +29,7 @@ class PredictionResponse(BaseModel):
     risk_score: float
     confidence: str
     risk_factors: list[str]
+    flagged_words: Optional[list[str]] = None
     gemini_analysis: Optional[str] = None
 
 

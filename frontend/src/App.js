@@ -15,6 +15,8 @@ const defaultValues = {
   posts: 30,
   followers: 500,
   following: 300,
+  username: '',
+  bio_text: '',
 };
 
 const fieldLabels = {
@@ -78,6 +80,8 @@ function App() {
       posts: 2,
       followers: 15,
       following: 1500,
+      username: 'xkjr2938bot47',
+      bio_text: 'Free followers! DM me for promo code. Click link for giveaway! 💰💰💰',
     });
     setResult(null);
   };
@@ -95,6 +99,8 @@ function App() {
       posts: 350,
       followers: 12000,
       following: 800,
+      username: 'rajesh_dev',
+      bio_text: 'Software developer | AI enthusiast | Building cool things with code',
     });
     setResult(null);
   };
@@ -172,6 +178,28 @@ function App() {
                   )}
                 </div>
               ))}
+
+              {/* Text input fields for content analysis */}
+              <div style={{ ...styles.field, marginTop: 16 }}>
+                <label style={styles.label}>Username (optional)</label>
+                <input
+                  type="text"
+                  placeholder="e.g. john_doe_123"
+                  value={formData.username}
+                  onChange={e => handleChange('username', e.target.value)}
+                  style={styles.input}
+                />
+              </div>
+              <div style={styles.field}>
+                <label style={styles.label}>Bio / Description Text (optional)</label>
+                <textarea
+                  placeholder="Paste the account's bio text here for content analysis..."
+                  value={formData.bio_text}
+                  onChange={e => handleChange('bio_text', e.target.value)}
+                  rows={3}
+                  style={{ ...styles.input, resize: 'vertical', fontFamily: 'inherit' }}
+                />
+              </div>
 
               <div style={styles.field}>
                 <label style={styles.label}>
@@ -260,6 +288,25 @@ function App() {
                     </div>
                   ))}
                 </div>
+
+                {/* Flagged Words */}
+                {result.flagged_words && result.flagged_words.length > 0 && (
+                  <div style={styles.riskSection}>
+                    <h4 style={styles.sectionTitle}>🚩 Flagged Suspicious Words</h4>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                      {result.flagged_words.map((word, i) => (
+                        <span key={i} style={{
+                          padding: '4px 10px',
+                          backgroundColor: '#7f1d1d',
+                          color: '#fca5a5',
+                          borderRadius: 6,
+                          fontSize: 12,
+                          fontWeight: 600,
+                        }}>{word}</span>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {/* Gemini Analysis */}
                 {result.gemini_analysis && (

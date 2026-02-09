@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from schemas import AccountFeatures, PredictionResponse, HealthResponse
-from utils import compute_engineered_features, identify_risk_factors, get_confidence_level, get_gemini_analysis
+from utils import compute_engineered_features, identify_risk_factors, get_confidence_level, get_gemini_analysis, scan_for_suspicious_words
 
 # Paths
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
@@ -91,14 +91,31 @@ def predict(account: AccountFeatures):
     confidence = get_confidence_level(risk_score)
     risk_factors = identify_risk_factors(raw_features, risk_score)
 
+    # Scan text content for suspicious words
+    flagged_words = scan_for_suspicious_words(
+        username=account.username,
+        bio_text=account.bio_text
+    )
+
+    # Add flagged words to risk factors
+    if flagged_words:
+        for word in flagged_words:
+            risk_factors.append(f"Suspicious text: \"{word}\"")
+
     # Gemini LLM analysis
-    gemini_analysis = get_gemini_analysis(raw_features, risk_score, prediction)
+    gemini_analysis = get_gemini_analysis(
+        raw_features, risk_score, prediction,
+        username=account.username,
+        bio_text=account.bio_text,
+        flagged_words=flagged_words
+    )
 
     return PredictionResponse(
         prediction=prediction,
         risk_score=round(risk_score, 4),
         confidence=confidence,
         risk_factors=risk_factors,
+        flagged_words=flagged_words if flagged_words else None,
         gemini_analysis=gemini_analysis
     )
 
@@ -133,10 +150,21 @@ def predict_quick(account: AccountFeatures):
     confidence = get_confidence_level(risk_score)
     risk_factors = identify_risk_factors(raw_features, risk_score)
 
+    # Scan text content for suspicious words
+    flagged_words = scan_for_suspicious_words(
+        username=account.username,
+        bio_text=account.bio_text
+    )
+
+    if flagged_words:
+        for word in flagged_words:
+            risk_factors.append(f"Suspicious text: \"{word}\"")
+
     return PredictionResponse(
         prediction=prediction,
         risk_score=round(risk_score, 4),
         confidence=confidence,
         risk_factors=risk_factors,
+        flagged_words=flagged_words if flagged_words else None,
         gemini_analysis=None
     )
