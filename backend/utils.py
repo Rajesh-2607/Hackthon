@@ -97,10 +97,16 @@ def get_confidence_level(risk_score: float) -> str:
 
 # ---------- Gemini LLM Integration ----------
 
-def get_gemini_analysis(features: dict, risk_score: float, prediction: str) -> str:
+def get_gemini_analysis(features: dict, risk_score: float, prediction: str, bio: str = "") -> str:
     """
     Use Google Gemini 2.5 to generate a natural language analysis
     of the account's authenticity.
+    
+    Args:
+        features: Dictionary of account features
+        risk_score: ML model risk score (0-1)
+        prediction: "Fake Account" or "Real Account"
+        bio: Account biography/description text
     """
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -112,6 +118,9 @@ def get_gemini_analysis(features: dict, risk_score: float, prediction: str) -> s
         "models/gemini-2.0-flash",
         "models/gemini-2.5-pro",
     ]
+    
+    # Truncate bio if too long
+    bio_text = bio[:500] if bio else "No bio provided"
 
     prompt = f"""You are a social media security analyst AI. Analyze this account profile and provide a concise threat assessment.
 
@@ -122,6 +131,7 @@ Account Profile Data:
 - Full Name Digit Ratio: {features["nums_length_fullname"]:.0%}
 - Name Equals Username: {"Yes" if features["name_eq_username"] else "No"}
 - Bio Length: {features["description_length"]} chars
+- Bio Content: "{bio_text}"
 - Has External URL: {"Yes" if features["external_url"] else "No"}
 - Private Account: {"Yes" if features["private"] else "No"}
 - Number of Posts: {features["posts"]}
@@ -133,7 +143,7 @@ Risk Score: {risk_score:.2%}
 
 Provide a brief 3-4 sentence analysis covering:
 1. Why this account appears {prediction.lower()}
-2. Key behavioral red flags or positive signals
+2. Key behavioral red flags or positive signals (including analysis of the bio content if provided)
 3. Recommended action for the platform
 
 Be concise and professional. Do not use markdown formatting."""
