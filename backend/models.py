@@ -106,3 +106,41 @@ class User(Base):
     def __repr__(self):
         return f"<User(id={self.id}, email='{self.email}')>"
 
+
+class TokenBlacklist(Base):
+    """
+    Blacklisted JWT tokens.
+    Tokens are added here on logout to prevent reuse.
+    """
+    __tablename__ = "token_blacklist"
+    
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    jti = Column(String(100), unique=True, nullable=False, index=True)  # JWT ID
+    token_type = Column(String(20), nullable=False)  # "access" or "refresh"
+    user_email = Column(String(255), nullable=True, index=True)
+    blacklisted_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False)  # When token would expire
+    
+    def __repr__(self):
+        return f"<TokenBlacklist(jti='{self.jti}', type='{self.token_type}')>"
+
+
+class RefreshToken(Base):
+    """
+    Active refresh tokens for users.
+    Used for token rotation - each refresh generates a new token.
+    """
+    __tablename__ = "refresh_tokens"
+    
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    jti = Column(String(100), unique=True, nullable=False, index=True)  # JWT ID
+    user_email = Column(String(255), nullable=False, index=True)
+    token_hash = Column(String(255), nullable=False)  # Hashed refresh token
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    is_revoked = Column(Boolean, default=False)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    replaced_by = Column(String(100), nullable=True)  # JTI of new token (for rotation)
+    
+    def __repr__(self):
+        return f"<RefreshToken(jti='{self.jti}', user='{self.user_email}')>"

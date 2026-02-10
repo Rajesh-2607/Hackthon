@@ -9,6 +9,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Gemini models to try in order of preference
+MODELS = [
+    "models/gemini-2.5-flash",
+    "models/gemini-2.0-flash",
+    "models/gemini-2.5-pro",
+]
+
 # ---------- Suspicious / Unwanted Words ----------
 
 SUSPICIOUS_WORDS = [
@@ -160,7 +167,45 @@ def get_confidence_level(risk_score: float) -> str:
         return "Very Low"
 
 
-# ---------- Gemini LLM Integration ----------
+# ---------- Gemini LLM Integration with Ollama Fallback ----------
+
+# Ollama configuration
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_MODEL = "deepseek-r1:8b"
+
+
+def get_ollama_analysis(prompt: str) -> str:
+    """
+    Use local Ollama to generate analysis as fallback.
+    Requires Ollama running on localhost:11434.
+    """
+    import requests
+    
+    try:
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "num_predict": 500  # Limit response length
+                }
+            },
+            timeout=3600  # 60 minute timeout
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("response", "").strip()
+        else:
+            return f"Ollama error: HTTP {response.status_code}"
+    except requests.exceptions.ConnectionError:
+        return "Ollama error: Cannot connect to Ollama server. Make sure 'ollama serve' is running."
+    except Exception as e:
+        return f"Ollama error: {str(e)}"
+
 
 def get_gemini_analysis(features: dict, risk_score: float, prediction: str,
                         bio: str = "", username: str = None, bio_text: str = None,
@@ -168,6 +213,8 @@ def get_gemini_analysis(features: dict, risk_score: float, prediction: str,
     """
     Use Google Gemini to generate a natural language analysis
     of the account's authenticity, including text content analysis.
+    
+    Falls back to local Ollama if Gemini fails.
     
     Args:
         features: Dictionary of account features
@@ -179,47 +226,39 @@ def get_gemini_analysis(features: dict, risk_score: float, prediction: str,
         flagged_words: List of flagged suspicious words
     """
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return "Gemini analysis unavailable: API key not configured. Set GEMINI_API_KEY in .env file."
-
-    # Models to try in order of preference
-    MODELS = [
-        "models/gemini-2.5-flash",
-        "models/gemini-2.0-flash",
-        "models/gemini-2.5-pro",
-    ]
     
-    # Truncate bio if too long
-    bio_text = bio[:500] if bio else "No bio provided"
-
-    # Build optional text section
+    # Use bio_text if provided, otherwise fall back to bio parameter
+    actual_bio = bio_text if bio_text else bio
+    
+    # Build text analysis section if we have text content
     text_section = ""
-    if username or bio_text:
-        text_section += "\nUser-Provided Text Content:"
+    if username or actual_bio:
+        text_section = "\n\nText Content to Analyze:"
         if username:
-            text_section += f"\n- Username: \"{username}\""
-        if bio_text:
-            text_section += f"\n- Bio/Description Text: \"{bio_text}\""
-
+            text_section += f"\n- Username: @{username}"
+        if actual_bio:
+            text_section += f"\n- Bio: \"{actual_bio[:500]}\"" if len(actual_bio) > 500 else f"\n- Bio: \"{actual_bio}\""
+    
+    # Build flagged words section
     flagged_section = ""
     if flagged_words:
-        flagged_section = f"\n\nFlagged Suspicious Words/Patterns Found: {', '.join(flagged_words)}"
+        flagged_section = f"\n\n⚠️ FLAGGED SUSPICIOUS CONTENT:\n- " + "\n- ".join(flagged_words)
+    
+    prompt = f"""Analyze this Instagram account for authenticity.
 
-    prompt = f"""You are a social media security analyst AI. Analyze this account profile and provide a concise threat assessment.
-
-Account Profile Data:
-- Has Profile Picture: {"Yes" if features["profile_pic"] else "No"}
-- Username Digit Ratio: {features["nums_length_username"]:.0%}
-- Full Name Word Count: {features["fullname_words"]}
-- Full Name Digit Ratio: {features["nums_length_fullname"]:.0%}
-- Name Equals Username: {"Yes" if features["name_eq_username"] else "No"}
-- Bio Length: {features["description_length"]} chars
-- Bio Content: "{bio_text}"
-- Has External URL: {"Yes" if features["external_url"] else "No"}
-- Private Account: {"Yes" if features["private"] else "No"}
-- Number of Posts: {features["posts"]}
-- Followers: {features["followers"]}
-- Following: {features["following"]}
+Account Features:
+- Has profile picture: {"Yes" if features.get("profile_pic") else "No"}
+- Username digit ratio: {features.get("nums_length_username", 0):.2%}
+- Full name word count: {features.get("fullname_words", 0)}
+- Full name digit ratio: {features.get("nums_length_fullname", 0):.2%}
+- Username matches name: {"Yes" if features.get("name_eq_username") else "No"}
+- Bio length: {features.get("description_length", 0)} characters
+- Has external URL: {"Yes" if features.get("external_url") else "No"}
+- Private account: {"Yes" if features.get("private") else "No"}
+- Posts: {features.get("posts", 0)}
+- Followers: {features.get("followers", 0)}
+- Following: {features.get("following", 0)}
+- Bio Content: "{actual_bio}"
 {text_section}
 
 ML Model Prediction: {prediction}
@@ -234,17 +273,38 @@ Provide a brief 3-5 sentence analysis covering:
 
 Be concise and professional. Do not use markdown formatting."""
 
-    client = genai.Client(api_key=api_key)
-
-    for model_name in MODELS:
+    # Try Gemini first if API key is available
+    if api_key:
         try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
-            return response.text.strip()
+            client = genai.Client(api_key=api_key)
+            
+            for model_name in MODELS:
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt
+                    )
+                    return response.text.strip()
+                except Exception as e:
+                    last_error = str(e)
+                    continue
+            
+            # All Gemini models failed, try Ollama
+            print(f"[WARN] Gemini failed: {last_error}. Falling back to Ollama...")
         except Exception as e:
-            last_error = str(e)
-            continue
-
-    return f"Gemini analysis error: All models failed. Last error: {last_error}"
+            print(f"[WARN] Gemini client error: {e}. Falling back to Ollama...")
+    else:
+        print("[INFO] No GEMINI_API_KEY found. Using Ollama for analysis...")
+    
+    # Fallback to Ollama
+    ollama_result = get_ollama_analysis(prompt)
+    
+    # Clean up deepseek-r1 thinking tags if present
+    if "<think>" in ollama_result and "</think>" in ollama_result:
+        import re
+        ollama_result = re.sub(r'<think>.*?</think>', '', ollama_result, flags=re.DOTALL).strip()
+    
+    if ollama_result.startswith("Ollama error:"):
+        return f"AI analysis unavailable. {ollama_result}"
+    
+    return ollama_result

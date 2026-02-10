@@ -41,8 +41,15 @@ class UserResponse(BaseModel):
 class TokenResponse(BaseModel):
     """Response schema for authentication token."""
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"
+    expires_in: int = Field(default=900, description="Access token expiry in seconds (15 min)")
     user: UserResponse
+
+
+class RefreshTokenRequest(BaseModel):
+    """Request schema for token refresh."""
+    refresh_token: str = Field(..., description="The refresh token")
 
 
 # ============== Account Features Schemas ==============
@@ -83,6 +90,10 @@ class PredictionResponse(BaseModel):
     risk_factors: list[str]
     flagged_words: Optional[list[str]] = None
     gemini_analysis: Optional[str] = None
+    # Cache metadata
+    cached: bool = Field(default=False, description="True if result is from cache")
+    username: Optional[str] = Field(default=None, description="Instagram username analyzed")
+    analyzed_at: Optional[str] = Field(default=None, description="When the analysis was performed (ISO format)")
 
 class GeminiAnalysisRequest(BaseModel):
     """Request for Gemini LLM analysis."""
