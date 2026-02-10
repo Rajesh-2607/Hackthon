@@ -4,16 +4,29 @@ FastAPI Backend - Fake Account Detection API
 import os
 import pickle
 import numpy as np
-from fastapi import FastAPI, HTTPException, Depends, Request
+from datetime import datetime, timedelta
+from fastapi import FastAPI, HTTPException, Depends, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from instagram_scraper import parse_instagram_input
-from schemas import AccountFeatures, PredictionResponse, HealthResponse, InstagramScrapeRequest, UserRegister, UserLogin, TokenResponse, UserResponse
+from schemas import (
+    AccountFeatures, PredictionResponse, HealthResponse, InstagramScrapeRequest,
+    UserRegister, UserLogin, TokenResponse, UserResponse, RefreshTokenRequest
+)
 from utils import compute_engineered_features, identify_risk_factors, get_confidence_level, get_gemini_analysis, scan_for_suspicious_words
 from database import get_db, init_db
-from crud import create_analysis, get_all_analyses, get_recent_analyses, create_user, get_user_by_email, update_last_login
+from crud import (
+    create_analysis, get_all_analyses, get_recent_analyses, create_user, 
+    get_user_by_email, update_last_login, blacklist_token, is_token_blacklisted,
+    store_refresh_token, validate_refresh_token, revoke_refresh_token, rotate_refresh_token,
+    get_latest_analysis_by_username
+)
 from models import AnalysisHistory, User
-from auth import verify_password, create_access_token
+from auth import (
+    verify_password, create_access_token, create_refresh_token, create_token_pair,
+    decode_access_token, decode_refresh_token, get_token_jti,
+    ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
+)
 
 # Paths
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
@@ -77,7 +90,9 @@ def register(user_data: UserRegister, db: Session = Depends(get_db)):
     """
     Register a new user account.
     
-    Returns JWT token on successful registration.
+    Returns JWT access token and refresh token on successful registration.
+    - Access token expires in 15 minutes
+    - Refresh token expires in 7 days
     """
     # Check if email already exists
     existing_user = get_user_by_email(db, user_data.email)
@@ -96,12 +111,25 @@ def register(user_data: UserRegister, db: Session = Depends(get_db)):
         phone=user_data.phone
     )
     
-    # Generate token
-    access_token = create_access_token(data={"sub": new_user.email})
+    # Generate token pair
+    access_token, refresh_token = create_token_pair(new_user.email)
+    
+    # Store refresh token in DB
+    refresh_jti = get_token_jti(refresh_token, "refresh")
+    if refresh_jti:
+        store_refresh_token(
+            db=db,
+            jti=refresh_jti,
+            user_email=new_user.email,
+            token=refresh_token,
+            expires_at=datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+        )
     
     return TokenResponse(
         access_token=access_token,
+        refresh_token=refresh_token,
         token_type="bearer",
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         user=UserResponse(
             id=new_user.id,
             email=new_user.email,
@@ -119,7 +147,9 @@ def login(credentials: UserLogin, db: Session = Depends(get_db)):
     """
     Login with email and password.
     
-    Returns JWT token on successful authentication.
+    Returns JWT access token and refresh token on successful authentication.
+    - Access token expires in 15 minutes
+    - Refresh token expires in 7 days
     """
     # Find user by email
     user = get_user_by_email(db, credentials.email)
@@ -147,12 +177,25 @@ def login(credentials: UserLogin, db: Session = Depends(get_db)):
     # Update last login
     update_last_login(db, user)
     
-    # Generate token
-    access_token = create_access_token(data={"sub": user.email})
+    # Generate token pair
+    access_token, refresh_token = create_token_pair(user.email)
+    
+    # Store refresh token in DB
+    refresh_jti = get_token_jti(refresh_token, "refresh")
+    if refresh_jti:
+        store_refresh_token(
+            db=db,
+            jti=refresh_jti,
+            user_email=user.email,
+            token=refresh_token,
+            expires_at=datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+        )
     
     return TokenResponse(
         access_token=access_token,
+        refresh_token=refresh_token,
         token_type="bearer",
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         user=UserResponse(
             id=user.id,
             email=user.email,
@@ -163,6 +206,164 @@ def login(credentials: UserLogin, db: Session = Depends(get_db)):
             created_at=user.created_at
         )
     )
+
+
+@app.post("/refresh", response_model=TokenResponse)
+def refresh_tokens(request: RefreshTokenRequest, db: Session = Depends(get_db)):
+    """
+    Refresh access token using a valid refresh token.
+    
+    Implements token rotation:
+    - Old refresh token is revoked
+    - New access + refresh token pair is issued
+    """
+    # Decode refresh token
+    payload = decode_refresh_token(request.refresh_token)
+    if not payload:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired refresh token"
+        )
+    
+    old_jti = payload.get("jti")
+    user_email = payload.get("sub")
+    
+    # Check if token is blacklisted
+    if old_jti and is_token_blacklisted(db, old_jti):
+        raise HTTPException(
+            status_code=401,
+            detail="Token has been revoked"
+        )
+    
+    # Validate refresh token exists in DB and is not revoked
+    if not validate_refresh_token(db, old_jti, request.refresh_token):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or revoked refresh token"
+        )
+    
+    # Get user
+    user = get_user_by_email(db, user_email)
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=401,
+            detail="User not found or inactive"
+        )
+    
+    # Generate new token pair
+    new_access_token, new_refresh_token = create_token_pair(user_email)
+    new_jti = get_token_jti(new_refresh_token, "refresh")
+    
+    # Rotate refresh token (revoke old, store new)
+    if old_jti and new_jti:
+        rotate_refresh_token(
+            db=db,
+            old_jti=old_jti,
+            new_jti=new_jti,
+            user_email=user_email,
+            new_token=new_refresh_token,
+            expires_at=datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+        )
+    
+    return TokenResponse(
+        access_token=new_access_token,
+        refresh_token=new_refresh_token,
+        token_type="bearer",
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user=UserResponse(
+            id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            phone=user.phone,
+            is_active=user.is_active,
+            is_verified=user.is_verified,
+            created_at=user.created_at
+        )
+    )
+
+
+@app.post("/logout")
+def logout(
+    authorization: str = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db)
+):
+    """
+    Logout and blacklist tokens.
+    
+    Pass both access and refresh tokens to fully logout.
+    Tokens are added to blacklist to prevent reuse.
+    
+    Headers:
+    - Authorization: Bearer <access_token>
+    
+    Body (optional):
+    - refresh_token: The refresh token to revoke
+    """
+    tokens_blacklisted = []
+    
+    # Blacklist access token from header
+    if authorization and authorization.startswith("Bearer "):
+        access_token = authorization.split(" ")[1]
+        payload = decode_access_token(access_token)
+        if payload:
+            jti = payload.get("jti")
+            exp = payload.get("exp")
+            user_email = payload.get("sub")
+            if jti:
+                try:
+                    blacklist_token(
+                        db=db,
+                        jti=jti,
+                        token_type="access",
+                        expires_at=datetime.fromtimestamp(exp) if exp else datetime.utcnow() + timedelta(minutes=15),
+                        user_email=user_email
+                    )
+                    tokens_blacklisted.append("access_token")
+                except Exception:
+                    pass  # Token may already be blacklisted
+    
+    return {
+        "success": True,
+        "message": "Logged out successfully",
+        "tokens_revoked": tokens_blacklisted
+    }
+
+
+@app.post("/logout/all")
+def logout_all_devices(
+    authorization: str = Header(..., alias="Authorization"),
+    db: Session = Depends(get_db)
+):
+    """
+    Logout from all devices by revoking all refresh tokens for the user.
+    
+    Requires valid access token in Authorization header.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    
+    access_token = authorization.split(" ")[1]
+    payload = decode_access_token(access_token)
+    
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired access token")
+    
+    # Check if token is blacklisted
+    jti = payload.get("jti")
+    if jti and is_token_blacklisted(db, jti):
+        raise HTTPException(status_code=401, detail="Token has been revoked")
+    
+    user_email = payload.get("sub")
+    
+    # Import and revoke all user tokens
+    from crud import revoke_all_user_tokens
+    revoked_count = revoke_all_user_tokens(db, user_email)
+    
+    return {
+        "success": True,
+        "message": f"Logged out from all devices",
+        "sessions_revoked": revoked_count
+    }
 
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -281,19 +482,67 @@ def predict_quick(account: AccountFeatures):
 def analyze_instagram(request: InstagramScrapeRequest, req: Request, db: Session = Depends(get_db)):
     """
     Analyze an Instagram profile by URL or username.
-    Scrapes the profile, extracts features, and runs prediction.
-    Results are saved to the database.
+    
+    CACHING: First checks database for existing analysis.
+    If found, returns cached result immediately (much faster).
+    If not found, scrapes the profile and runs prediction.
     
     Accepts:
     - Instagram URL: https://instagram.com/username
     - Username: @username or just username
+    
+    Query params:
+    - force_refresh: Set to true to bypass cache and re-analyze
     """
     if model is None or scaler is None:
         raise HTTPException(status_code=503, detail="Model not loaded. Train the model first.")
     
+    # Extract username from input for cache lookup
+    from instagram_scraper import InstagramScraperService
+    scraper_service = InstagramScraperService()
+    
+    try:
+        input_type, username = scraper_service.classify_input(request.input)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    # Check if we should bypass cache (optional query param from frontend)
+    force_refresh = getattr(request, 'force_refresh', False)
+    
+    # Check database for existing analysis
+    if not force_refresh:
+        cached_result = get_latest_analysis_by_username(db, username)
+        
+        if cached_result:
+            print(f"[CACHE HIT] Returning cached analysis for @{username}")
+            
+            # Parse risk_factors from JSON if stored as string
+            import json
+            risk_factors = cached_result.risk_factors
+            if isinstance(risk_factors, str):
+                try:
+                    risk_factors = json.loads(risk_factors)
+                except:
+                    risk_factors = []
+            
+            return PredictionResponse(
+                prediction=cached_result.prediction,
+                risk_score=round(cached_result.risk_score, 4),
+                confidence=cached_result.confidence,
+                risk_factors=risk_factors if risk_factors else [],
+                gemini_analysis=cached_result.gemini_analysis,
+                flagged_words=None,  # Not stored in cache
+                cached=True,
+                username=username,
+                analyzed_at=cached_result.analyzed_at.isoformat() if cached_result.analyzed_at else None
+            )
+    
+    print(f"[CACHE MISS] Fetching fresh data for @{username}")
+    
     try:
         # Scrape and extract features from Instagram profile
         scraped_data = parse_instagram_input(request.input)
+
         
         # Remove metadata for prediction (keep for reference)
         metadata = scraped_data.pop("_metadata", {})

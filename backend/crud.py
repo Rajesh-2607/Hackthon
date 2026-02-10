@@ -2,10 +2,11 @@
 CRUD operations for database models.
 """
 from sqlalchemy.orm import Session
-from models import AnalysisHistory, ScrapedProfile, User
+from models import AnalysisHistory, ScrapedProfile, User, TokenBlacklist, RefreshToken
 from typing import List, Optional
 from datetime import datetime
 import json
+import hashlib
 from auth import hash_password
 
 
@@ -106,6 +107,16 @@ def get_analyses_by_username(db: Session, username: str) -> List[AnalysisHistory
     return db.query(AnalysisHistory).filter(AnalysisHistory.username == username).all()
 
 
+def get_latest_analysis_by_username(db: Session, username: str) -> Optional[AnalysisHistory]:
+    """
+    Get the most recent analysis for a specific username.
+    Used for caching - returns None if no previous analysis exists.
+    """
+    return db.query(AnalysisHistory).filter(
+        AnalysisHistory.username == username
+    ).order_by(AnalysisHistory.analyzed_at.desc()).first()
+
+
 def get_all_analyses(db: Session, skip: int = 0, limit: int = 100) -> List[AnalysisHistory]:
     """Get all analyses with pagination."""
     return db.query(AnalysisHistory).order_by(AnalysisHistory.analyzed_at.desc()).offset(skip).limit(limit).all()
@@ -188,3 +199,159 @@ def get_profile_by_username(db: Session, username: str) -> Optional[ScrapedProfi
 def get_all_profiles(db: Session, skip: int = 0, limit: int = 100) -> List[ScrapedProfile]:
     """Get all profiles with pagination."""
     return db.query(ScrapedProfile).offset(skip).limit(limit).all()
+
+
+# ============== Token Blacklist CRUD ==============
+
+def _hash_token(token: str) -> str:
+    """Create a hash of a token for secure storage."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def blacklist_token(
+    db: Session,
+    jti: str,
+    token_type: str,
+    expires_at: datetime,
+    user_email: Optional[str] = None
+) -> TokenBlacklist:
+    """
+    Add a token to the blacklist.
+    Called on logout to invalidate tokens.
+    """
+    db_blacklist = TokenBlacklist(
+        jti=jti,
+        token_type=token_type,
+        user_email=user_email,
+        expires_at=expires_at
+    )
+    db.add(db_blacklist)
+    db.commit()
+    db.refresh(db_blacklist)
+    return db_blacklist
+
+
+def is_token_blacklisted(db: Session, jti: str) -> bool:
+    """Check if a token's JTI is in the blacklist."""
+    return db.query(TokenBlacklist).filter(TokenBlacklist.jti == jti).first() is not None
+
+
+def cleanup_expired_blacklist(db: Session) -> int:
+    """Remove expired tokens from blacklist to save space."""
+    result = db.query(TokenBlacklist).filter(
+        TokenBlacklist.expires_at < datetime.utcnow()
+    ).delete()
+    db.commit()
+    return result
+
+
+# ============== Refresh Token CRUD ==============
+
+def store_refresh_token(
+    db: Session,
+    jti: str,
+    user_email: str,
+    token: str,
+    expires_at: datetime
+) -> RefreshToken:
+    """
+    Store a refresh token in the database.
+    Token is hashed for security.
+    """
+    db_token = RefreshToken(
+        jti=jti,
+        user_email=user_email,
+        token_hash=_hash_token(token),
+        expires_at=expires_at
+    )
+    db.add(db_token)
+    db.commit()
+    db.refresh(db_token)
+    return db_token
+
+
+def get_refresh_token(db: Session, jti: str) -> Optional[RefreshToken]:
+    """Get a refresh token by its JTI."""
+    return db.query(RefreshToken).filter(RefreshToken.jti == jti).first()
+
+
+def validate_refresh_token(db: Session, jti: str, token: str) -> bool:
+    """
+    Validate a refresh token exists and is not revoked.
+    Also verifies the token hash matches.
+    """
+    db_token = get_refresh_token(db, jti)
+    if not db_token:
+        return False
+    if db_token.is_revoked:
+        return False
+    if db_token.expires_at < datetime.utcnow():
+        return False
+    # Verify token hash
+    if db_token.token_hash != _hash_token(token):
+        return False
+    return True
+
+
+def revoke_refresh_token(db: Session, jti: str) -> bool:
+    """Revoke a specific refresh token."""
+    db_token = get_refresh_token(db, jti)
+    if db_token:
+        db_token.is_revoked = True
+        db_token.revoked_at = datetime.utcnow()
+        db.commit()
+        return True
+    return False
+
+
+def revoke_all_user_tokens(db: Session, user_email: str) -> int:
+    """Revoke all refresh tokens for a user (e.g., on password change)."""
+    result = db.query(RefreshToken).filter(
+        RefreshToken.user_email == user_email,
+        RefreshToken.is_revoked == False
+    ).update({
+        "is_revoked": True,
+        "revoked_at": datetime.utcnow()
+    })
+    db.commit()
+    return result
+
+
+def rotate_refresh_token(
+    db: Session,
+    old_jti: str,
+    new_jti: str,
+    user_email: str,
+    new_token: str,
+    expires_at: datetime
+) -> Optional[RefreshToken]:
+    """
+    Rotate a refresh token: revoke old one, create new one.
+    Used for refresh token rotation security.
+    """
+    # Revoke old token and mark replacement
+    old_token = get_refresh_token(db, old_jti)
+    if old_token:
+        old_token.is_revoked = True
+        old_token.revoked_at = datetime.utcnow()
+        old_token.replaced_by = new_jti
+    
+    # Create new token
+    new_token_record = store_refresh_token(
+        db=db,
+        jti=new_jti,
+        user_email=user_email,
+        token=new_token,
+        expires_at=expires_at
+    )
+    
+    return new_token_record
+
+
+def cleanup_expired_refresh_tokens(db: Session) -> int:
+    """Remove expired refresh tokens to save space."""
+    result = db.query(RefreshToken).filter(
+        RefreshToken.expires_at < datetime.utcnow()
+    ).delete()
+    db.commit()
+    return result
